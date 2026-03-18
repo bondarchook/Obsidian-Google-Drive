@@ -1,10 +1,9 @@
 import { checkConnection, getDriveClient } from "helpers/drive";
 import { refreshAccessToken } from "helpers/ky";
 import {
-	buildAuthorizationUrl,
-	createOAuthPending,
-	exchangeAuthorizationCode,
-	parseOAuthCallbackInput,
+	DeviceAuthorizationPollingError,
+	startDeviceAuthorization,
+	pollDeviceAuthorization,
 } from "helpers/oauth";
 import { pull } from "helpers/pull";
 import { push } from "helpers/push";
@@ -23,12 +22,8 @@ import {
 
 interface PluginSettings {
 	oauthClientId: string;
-	oauthRedirectUri: string;
 	accessToken: string;
 	accessTokenExpiresAt: number;
-	oauthState: string;
-	oauthCodeVerifier: string;
-	oauthStartedAt: number;
 	refreshToken: string;
 	operations: Record<string, "create" | "delete" | "modify">;
 	driveIdToPath: Record<string, string>;
@@ -38,12 +33,8 @@ interface PluginSettings {
 
 const DEFAULT_SETTINGS: PluginSettings = {
 	oauthClientId: "",
-	oauthRedirectUri: "obsidian://google-drive-sync-oauth",
 	accessToken: "",
 	accessTokenExpiresAt: 0,
-	oauthState: "",
-	oauthCodeVerifier: "",
-	oauthStartedAt: 0,
 	refreshToken: "",
 	operations: {},
 	driveIdToPath: {},
@@ -60,18 +51,17 @@ export default class ObsidianGoogleDrive extends Plugin {
 	drive = getDriveClient(this);
 	ribbonIcon: HTMLElement;
 	syncing: boolean;
-	private static readonly OAUTH_ACTION = "google-drive-sync-oauth";
+	deviceAuthStatus = "Idle";
+	deviceAuthInProgress = false;
+	cancelDeviceAuthPolling = false;
+	deviceAuthUserCode = "";
+	deviceAuthVerificationUrl = "";
+	deviceAuthExpiresAt = 0;
 
 	async onload() {
 		const { vault } = this.app;
 
 		await this.loadSettings();
-		this.registerObsidianProtocolHandler(
-			ObsidianGoogleDrive.OAUTH_ACTION,
-			(params) => {
-				void this.completeOAuth(params);
-			}
-		);
 
 		this.addSettingTab(new SettingsTab(this.app, this));
 
@@ -175,13 +165,6 @@ export default class ObsidianGoogleDrive extends Plugin {
 			DEFAULT_SETTINGS,
 			await this.loadData()
 		);
-
-		if (
-			this.settings.oauthState &&
-			Date.now() - this.settings.oauthStartedAt > 10 * 60 * 1000
-		) {
-			this.clearOAuthPending();
-		}
 	}
 
 	saveSettings() {
@@ -189,24 +172,6 @@ export default class ObsidianGoogleDrive extends Plugin {
 	}
 
 	debouncedSaveSettings = debounce(this.saveSettings.bind(this), 500, true);
-
-	private clearOAuthPending() {
-		this.settings.oauthState = "";
-		this.settings.oauthCodeVerifier = "";
-		this.settings.oauthStartedAt = 0;
-	}
-
-	private getOAuthPending() {
-		if (!this.settings.oauthState || !this.settings.oauthCodeVerifier) {
-			return;
-		}
-
-		return {
-			state: this.settings.oauthState,
-			codeVerifier: this.settings.oauthCodeVerifier,
-			issuedAt: this.settings.oauthStartedAt,
-		};
-	}
 
 	private isVaultReadyForInitialSync() {
 		if (this.settings.changesToken) {
@@ -229,6 +194,28 @@ export default class ObsidianGoogleDrive extends Plugin {
 		return true;
 	}
 
+	private applyOAuthTokens(tokens: {
+		accessToken: string;
+		refreshToken?: string;
+		expiresIn: number;
+	}) {
+		this.settings.refreshToken = tokens.refreshToken || this.settings.refreshToken;
+		this.settings.accessToken = tokens.accessToken;
+		this.settings.accessTokenExpiresAt = Date.now() + tokens.expiresIn * 1000;
+		this.accessToken = {
+			token: this.settings.accessToken,
+			expiresAt: this.settings.accessTokenExpiresAt,
+		};
+	}
+
+	private clearDeviceAuthRuntimeState() {
+		this.deviceAuthUserCode = "";
+		this.deviceAuthVerificationUrl = "";
+		this.deviceAuthExpiresAt = 0;
+		this.deviceAuthInProgress = false;
+		this.cancelDeviceAuthPolling = false;
+	}
+
 	async startOAuthFlow() {
 		if (!this.settings.oauthClientId.trim()) {
 			new Notice("Set a Google OAuth client ID in plugin settings first.", 0);
@@ -239,109 +226,98 @@ export default class ObsidianGoogleDrive extends Plugin {
 			return;
 		}
 
-		const pending = await createOAuthPending();
-		this.settings.oauthState = pending.state;
-		this.settings.oauthCodeVerifier = pending.codeVerifier;
-		this.settings.oauthStartedAt = pending.issuedAt;
-		await this.saveSettings();
-
-		const url = await buildAuthorizationUrl({
-			clientId: this.settings.oauthClientId.trim(),
-			redirectUri: this.settings.oauthRedirectUri.trim(),
-			pending,
-		});
-
-		window.open(url, "_blank", "noopener");
-		new Notice(
-			"Browser opened for Google sign-in. If Obsidian does not return automatically, paste the full callback URL in plugin settings.",
-			0
-		);
-	}
-
-	async completeOAuthFromInput(input: string) {
-		const params = parseOAuthCallbackInput(input);
-		await this.completeOAuth(params);
-	}
-
-	async completeOAuth(params: Record<string, string | "true">) {
-		if (typeof params.error === "string") {
-			new Notice(`Google OAuth error: ${params.error}`, 0);
-			this.clearOAuthPending();
-			await this.saveSettings();
-			return;
-		}
-
-		const code = typeof params.code === "string" ? params.code : "";
-		if (!code) {
-			new Notice("Missing OAuth code in callback.", 0);
-			return;
-		}
-
-		const pending = this.getOAuthPending();
-		if (!pending) {
-			new Notice(
-				"OAuth session was not found. Start 'Connect Google Account' again.",
-				0
-			);
-			return;
-		}
-
-		const incomingState =
-			typeof params.state === "string" ? params.state : "";
-		if (incomingState && incomingState !== pending.state) {
-			new Notice("OAuth state mismatch. Please retry sign-in.", 0);
-			this.clearOAuthPending();
-			await this.saveSettings();
-			return;
-		}
+		this.deviceAuthInProgress = true;
+		this.cancelDeviceAuthPolling = false;
+		this.deviceAuthStatus = "Requesting device code...";
 
 		try {
-			const tokens = await exchangeAuthorizationCode({
+			const deviceAuth = await startDeviceAuthorization({
 				clientId: this.settings.oauthClientId.trim(),
-				redirectUri: this.settings.oauthRedirectUri.trim(),
-				code,
-				codeVerifier: pending.codeVerifier,
+			});
+			this.deviceAuthUserCode = deviceAuth.userCode;
+			this.deviceAuthVerificationUrl =
+				deviceAuth.verificationUrlComplete || deviceAuth.verificationUrl;
+			this.deviceAuthExpiresAt = Date.now() + deviceAuth.expiresIn * 1000;
+			this.deviceAuthStatus = "Waiting for approval in browser...";
+
+			window.open(this.deviceAuthVerificationUrl, "_blank", "noopener");
+			new Notice(
+				`Open ${deviceAuth.verificationUrl} and enter code ${deviceAuth.userCode}.`,
+				0
+			);
+
+			const tokens = await pollDeviceAuthorization({
+				clientId: this.settings.oauthClientId.trim(),
+				deviceCode: deviceAuth.deviceCode,
+				interval: deviceAuth.interval,
+				expiresIn: deviceAuth.expiresIn,
+				isCancelled: () => this.cancelDeviceAuthPolling,
 			});
 
 			if (!tokens.refreshToken && !this.settings.refreshToken) {
 				new Notice(
-					"OAuth succeeded but no refresh token was returned. Revoke app access in your Google account and try connecting again.",
+					"Google sign-in succeeded but no refresh token was returned. Revoke app access in Google and try connecting again.",
 					0
 				);
+				this.deviceAuthStatus = "No refresh token returned.";
 				return;
 			}
 
-			this.settings.refreshToken = tokens.refreshToken || this.settings.refreshToken;
-			this.settings.accessToken = tokens.accessToken;
-			this.settings.accessTokenExpiresAt =
-				Date.now() + tokens.expiresIn * 1000;
-			this.accessToken = {
-				token: this.settings.accessToken,
-				expiresAt: this.settings.accessTokenExpiresAt,
-			};
+			this.applyOAuthTokens(tokens);
 
 			if (!this.settings.changesToken) {
 				const changesToken = await this.drive.getChangesStartToken();
 				if (!changesToken) {
 					new Notice("Connected, but failed to fetch Drive changes token.", 0);
+					this.deviceAuthStatus = "Connected, but changes token fetch failed.";
 					return;
 				}
 				this.settings.changesToken = changesToken;
 			}
 
-			this.clearOAuthPending();
+			this.deviceAuthStatus = "Connected";
 			await this.saveSettings();
 			new Notice(
 				"Google account connected. Reload Obsidian to activate full sync events and ribbon actions.",
 				0
 			);
 		} catch (error) {
-			new Notice("Google OAuth code exchange failed. Please try again.", 0);
+			if (
+				error instanceof DeviceAuthorizationPollingError &&
+				error.code === "access_denied"
+			) {
+				this.deviceAuthStatus = "Sign-in denied by user.";
+				new Notice("Google sign-in was denied.", 0);
+			} else if (
+				error instanceof DeviceAuthorizationPollingError &&
+				error.code === "expired_token"
+			) {
+				this.deviceAuthStatus = "Sign-in expired. Start again.";
+				new Notice("Google sign-in expired. Please connect again.", 0);
+			} else if (
+				error instanceof DeviceAuthorizationPollingError &&
+				this.cancelDeviceAuthPolling
+			) {
+				this.deviceAuthStatus = "Sign-in canceled.";
+				new Notice("Google sign-in canceled.");
+			} else {
+				this.deviceAuthStatus = "Sign-in failed.";
+				new Notice("Google device authorization failed. Please try again.", 0);
+			}
+		} finally {
+			this.clearDeviceAuthRuntimeState();
 		}
 	}
 
+	cancelOAuthFlow() {
+		if (!this.deviceAuthInProgress) return;
+		this.cancelDeviceAuthPolling = true;
+		this.deviceAuthStatus = "Canceling sign-in...";
+	}
+
 	async disconnectOAuth() {
-		this.clearOAuthPending();
+		this.cancelDeviceAuthPolling = true;
+		this.clearDeviceAuthRuntimeState();
 		this.settings.refreshToken = "";
 		this.settings.accessToken = "";
 		this.settings.accessTokenExpiresAt = 0;
@@ -526,7 +502,7 @@ class SettingsTab extends PluginSettingTab {
 		new Setting(containerEl)
 			.setName("OAuth client ID")
 			.setDesc(
-				"Google OAuth client ID for this plugin. Use an app/client configured for Obsidian protocol redirects."
+				"Google OAuth client ID for a Device Authorization (TV and Limited Input devices) client."
 			)
 			.addText((text) => {
 				text
@@ -534,21 +510,6 @@ class SettingsTab extends PluginSettingTab {
 					.setValue(this.plugin.settings.oauthClientId)
 					.onChange((value) => {
 						this.plugin.settings.oauthClientId = value.trim();
-						this.plugin.debouncedSaveSettings();
-					});
-			});
-
-		new Setting(containerEl)
-			.setName("Redirect URI")
-			.setDesc(
-				"Obsidian callback URI. Keep default unless you have a custom protocol setup."
-			)
-			.addText((text) => {
-				text
-					.setPlaceholder("obsidian://google-drive-sync-oauth")
-					.setValue(this.plugin.settings.oauthRedirectUri)
-					.onChange((value) => {
-						this.plugin.settings.oauthRedirectUri = value.trim();
 						this.plugin.debouncedSaveSettings();
 					});
 			});
@@ -563,7 +524,17 @@ class SettingsTab extends PluginSettingTab {
 			.addButton((button) =>
 				button.setButtonText("Connect Google Account").onClick(async () => {
 					await this.plugin.startOAuthFlow();
+					this.display();
 				})
+			)
+			.addButton((button) =>
+				button
+					.setButtonText("Cancel Sign-In")
+					.setDisabled(!this.plugin.deviceAuthInProgress)
+					.onClick(() => {
+						this.plugin.cancelOAuthFlow();
+						this.display();
+					})
 			)
 			.addButton((button) =>
 				button.setButtonText("Disconnect").onClick(async () => {
@@ -572,28 +543,34 @@ class SettingsTab extends PluginSettingTab {
 				})
 			);
 
-		let callbackInput = "";
-		new Setting(containerEl)
-			.setName("Manual callback URL or code")
-			.setDesc(
-				"Fallback for Android/desktop if callback does not auto-return to Obsidian. Paste the full callback URL or just the code."
-			)
-			.addText((text) => {
-				text
-					.setPlaceholder("obsidian://google-drive-sync-oauth?code=...")
-					.onChange((value) => {
-						callbackInput = value;
-					});
-			})
-			.addButton((button) =>
-				button.setButtonText("Complete OAuth").onClick(async () => {
-					await this.plugin.completeOAuthFromInput(callbackInput);
-					this.display();
-				})
+		containerEl.createEl("p", {
+			text: `Status: ${this.plugin.deviceAuthStatus}`,
+		});
+
+		if (this.plugin.deviceAuthUserCode) {
+			containerEl.createEl("p", {
+				text: `Code: ${this.plugin.deviceAuthUserCode}`,
+			});
+		}
+
+		if (this.plugin.deviceAuthVerificationUrl) {
+			containerEl.createEl("p", {
+				text: `Verification URL: ${this.plugin.deviceAuthVerificationUrl}`,
+			});
+		}
+
+		if (this.plugin.deviceAuthExpiresAt) {
+			const secondsLeft = Math.max(
+				0,
+				Math.floor((this.plugin.deviceAuthExpiresAt - Date.now()) / 1000)
 			);
+			containerEl.createEl("p", {
+				text: `Code expires in about ${secondsLeft}s.`,
+			});
+		}
 
 		containerEl.createEl("p", {
-			text: "After connecting, reload Obsidian if sync ribbon/actions are not visible yet.",
+			text: "After clicking connect, approve in browser and wait for this settings page to update. Reload Obsidian after successful connection if sync actions are not visible yet.",
 		});
 	}
 }

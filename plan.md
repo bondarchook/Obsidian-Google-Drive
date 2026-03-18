@@ -158,3 +158,142 @@ Update docs and public metadata:
 - Access token refresh works without manual copy/paste after initial consent.
 - Auth errors are user-actionable and do not corrupt sync state.
 - README setup steps reflect only the new OAuth flow.
+
+---
+
+## Phase 2 Plan: Switch To Google Device Authorization Flow
+
+## Why Phase 2 Is Required
+- Google OAuth redirect URI policies reject custom scheme redirects like `obsidian://...` for this client configuration.
+- Device Authorization flow avoids redirect URI entirely and is designed for apps with limited browser callback control.
+- This is the most reliable path for both Windows and Android in Obsidian.
+
+## Phase 2 Goal
+Replace the current authorization-code callback flow with Google OAuth Device Authorization flow, while preserving the direct Google token refresh path already implemented.
+
+## Target Flow (Device Code)
+1. User clicks `Connect Google Account`.
+2. Plugin requests a device code from Google's device authorization endpoint.
+3. Plugin shows:
+   - `user_code`
+   - `verification_url`
+   - optional `verification_url_complete`
+   - expiration countdown
+4. Plugin opens browser to verification URL.
+5. User signs in and approves scopes on any browser.
+6. Plugin polls token endpoint at provider-specified interval.
+7. On success, plugin stores refresh/access token and enables sync.
+
+## API Endpoints (Google)
+- Device authorization endpoint: `https://oauth2.googleapis.com/device/code`
+- Token endpoint: `https://oauth2.googleapis.com/token`
+
+## Planned Code Changes (Phase 2)
+
+### 1. OAuth Helper Rewrite
+Refactor [helpers/oauth.ts](helpers/oauth.ts) to:
+- Remove PKCE/callback-state logic.
+- Add `startDeviceAuthorization(clientId, scope)`.
+- Add `pollDeviceAuthorization({ clientId, deviceCode, interval, expiresIn })`.
+- Handle polling statuses:
+  - `authorization_pending`
+  - `slow_down`
+  - `access_denied`
+  - `expired_token`
+
+### 2. Main Plugin Auth Flow Update
+Refactor [main.ts](main.ts):
+- Remove protocol callback dependency for auth completion.
+- Replace `completeOAuth` callback path with polling lifecycle.
+- Add connect UI states:
+  - idle
+  - waiting_for_user_approval
+  - polling
+  - success
+  - canceled/expired/error
+- Add `Cancel Sign-In` action to stop polling cleanly.
+
+### 3. Settings Model Migration
+Update settings in [main.ts](main.ts):
+- Remove no-longer-needed fields after migration window:
+  - `oauthRedirectUri`
+  - `oauthState`
+  - `oauthCodeVerifier`
+  - `oauthStartedAt`
+- Add transient runtime state (not persisted long-term) for in-progress device flow.
+- Keep persisted:
+  - `oauthClientId`
+  - `refreshToken`
+  - `accessToken`
+  - `accessTokenExpiresAt`
+
+### 4. Token Refresh Layer
+Keep [helpers/ky.ts](helpers/ky.ts) direct Google refresh flow.
+- Validate compatibility with tokens issued by device flow.
+- Keep reconnect behavior for revoked tokens.
+
+### 5. UX and Copy
+Update settings UI and notices in [main.ts](main.ts):
+- Replace callback URL instructions with device-code instructions.
+- Display clear step-by-step in plugin UI:
+  1. open link
+  2. enter code
+  3. wait for approval
+- Provide explicit timeout and retry messaging.
+
+### 6. Documentation
+Update [README.md](README.md):
+- Replace redirect/callback setup instructions.
+- Add device-code onboarding flow for Windows and Android.
+- Document required Google OAuth client type for device flow.
+
+## Google Console Setup Requirements (Phase 2)
+- Use OAuth client type that supports Device Authorization flow.
+- No redirect URI configuration required.
+- Add test users if app is in testing mode.
+- Keep Drive API enabled and consent screen configured.
+
+## Error Handling Requirements
+- Network offline during polling: retry with backoff and user notice.
+- `slow_down`: increase poll interval per provider guidance.
+- `access_denied`: stop immediately and show actionable message.
+- `expired_token`: end flow and prompt user to restart connect.
+- Polling timeout: stop without corrupting existing token state.
+
+## Security Requirements (Phase 2)
+- No client secret embedded.
+- Do not log `device_code`, refresh token, or access token.
+- Clear in-progress auth state after completion/cancel/timeout.
+- Persist only required token fields.
+
+## Testing Plan (Phase 2)
+
+### Functional
+- New connect flow on Windows desktop.
+- New connect flow on Android.
+- Reconnect after disconnect.
+- Token refresh after access token expiry.
+
+### Failure Cases
+- User never approves (timeout).
+- User denies consent.
+- Polling rate-limit (`slow_down`).
+- Internet loss mid-poll.
+
+### Regression
+- Pull, push, reset unaffected by auth flow change.
+- Existing users with valid refresh tokens continue syncing.
+
+## Rollout Plan (Phase 2)
+1. Implement device-code helper APIs.
+2. Switch settings UI and auth state machine in plugin.
+3. Remove callback-only auth code paths.
+4. Update docs and setup instructions.
+5. Validate on Windows and Android with manual QA checklist.
+6. Release with migration notes.
+
+## Phase 2 Acceptance Criteria
+- No redirect URI is required for user onboarding.
+- Auth setup works on Windows and Android with a single documented flow.
+- User can complete sign-in even when Obsidian protocol callbacks are unavailable.
+- Token refresh and sync behavior remain stable after migration.

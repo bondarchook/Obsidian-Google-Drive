@@ -57,12 +57,13 @@ This is an unofficial sync plugin for Obsidian, specifically for Google Drive.
 
 1. Enable the Google Drive Sync plugin in Obsidian
 2. Open plugin settings
-3. Enter your Google OAuth client ID
+3. Enter your Google OAuth client ID for a Device Authorization client (`TV and Limited Input devices`)
 4. Click `Connect Google Account`
-5. Complete consent in your browser and return to Obsidian
-6. Reload the Obsidian app
+5. In browser, open the verification URL and enter the code shown in plugin settings
+6. Wait for plugin status to change to connected
+7. Reload the Obsidian app
 
-If Obsidian does not return automatically after browser consent (for example on some Android setups), paste the full callback URL in the plugin setting `Manual callback URL or code` and click `Complete OAuth`.
+No redirect URI is required for this setup flow.
 
 ## Use
 

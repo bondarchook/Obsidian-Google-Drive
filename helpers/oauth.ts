@@ -1,15 +1,9 @@
 import { requestUrl } from "obsidian";
 
-const GOOGLE_AUTH_ENDPOINT = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_DEVICE_ENDPOINT = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 
 export const OAUTH_SCOPE = "https://www.googleapis.com/auth/drive";
-
-export interface OAuthPending {
-	state: string;
-	codeVerifier: string;
-	issuedAt: number;
-}
 
 export interface OAuthTokens {
 	accessToken: string;
@@ -19,57 +13,33 @@ export interface OAuthTokens {
 	scope?: string;
 }
 
-const bytesToBase64Url = (bytes: Uint8Array) =>
-	btoa(String.fromCharCode(...bytes))
-		.replace(/\+/g, "-")
-		.replace(/\//g, "_")
-		.replace(/=+$/g, "");
+export interface DeviceAuthorizationResponse {
+	deviceCode: string;
+	userCode: string;
+	verificationUrl: string;
+	verificationUrlComplete?: string;
+	expiresIn: number;
+	interval: number;
+}
 
-const randomBase64Url = (bytes = 32) => {
-	const random = new Uint8Array(bytes);
-	crypto.getRandomValues(random);
-	return bytesToBase64Url(random);
-};
+export type DeviceAuthorizationError =
+	| "authorization_pending"
+	| "slow_down"
+	| "access_denied"
+	| "expired_token"
+	| "unknown";
 
-const sha256Base64Url = async (value: string) => {
-	const encoded = new TextEncoder().encode(value);
-	const hash = await crypto.subtle.digest("SHA-256", encoded);
-	return bytesToBase64Url(new Uint8Array(hash));
-};
+export class DeviceAuthorizationPollingError extends Error {
+	code: DeviceAuthorizationError;
 
-export const createOAuthPending = async (): Promise<OAuthPending> => {
-	const codeVerifier = randomBase64Url(64);
-	return {
-		state: randomBase64Url(32),
-		codeVerifier,
-		issuedAt: Date.now(),
-	};
-};
+	constructor(code: DeviceAuthorizationError, message: string) {
+		super(message);
+		this.code = code;
+	}
+}
 
-export const buildAuthorizationUrl = async ({
-	clientId,
-	redirectUri,
-	pending,
-}: {
-	clientId: string;
-	redirectUri: string;
-	pending: OAuthPending;
-}) => {
-	const codeChallenge = await sha256Base64Url(pending.codeVerifier);
-	const params = new URLSearchParams({
-		client_id: clientId,
-		redirect_uri: redirectUri,
-		response_type: "code",
-		scope: OAUTH_SCOPE,
-		state: pending.state,
-		code_challenge: codeChallenge,
-		code_challenge_method: "S256",
-		access_type: "offline",
-		prompt: "consent",
-		include_granted_scopes: "true",
-	});
-	return `${GOOGLE_AUTH_ENDPOINT}?${params.toString()}`;
-};
+const sleep = (ms: number) =>
+	new Promise<void>((resolve) => window.setTimeout(resolve, ms));
 
 const exchangeToken = async (
 	payload: Record<string, string>
@@ -95,25 +65,6 @@ const exchangeToken = async (
 	};
 };
 
-export const exchangeAuthorizationCode = async ({
-	clientId,
-	redirectUri,
-	code,
-	codeVerifier,
-}: {
-	clientId: string;
-	redirectUri: string;
-	code: string;
-	codeVerifier: string;
-}) =>
-	exchangeToken({
-		client_id: clientId,
-		redirect_uri: redirectUri,
-		grant_type: "authorization_code",
-		code,
-		code_verifier: codeVerifier,
-	});
-
 export const refreshWithGoogle = async ({
 	clientId,
 	refreshToken,
@@ -127,16 +78,131 @@ export const refreshWithGoogle = async ({
 		grant_type: "refresh_token",
 	});
 
-export const parseOAuthCallbackInput = (input: string) => {
-	const trimmed = input.trim();
-	if (!trimmed) {
-		return {} as Record<string, string>;
+export const startDeviceAuthorization = async ({
+	clientId,
+	scope = OAUTH_SCOPE,
+}: {
+	clientId: string;
+	scope?: string;
+}) =>
+	requestUrl({
+		url: GOOGLE_DEVICE_ENDPOINT,
+		method: "POST",
+		contentType: "application/x-www-form-urlencoded",
+		body: new URLSearchParams({
+			client_id: clientId,
+			scope,
+		}).toString(),
+		throw: false,
+	}).then((result) => {
+		if (result.status >= 400) {
+			throw new Error(
+				result.text || `Device authorization failed (${result.status}).`
+			);
+		}
+
+		return {
+			deviceCode: result.json.device_code,
+			userCode: result.json.user_code,
+			verificationUrl: result.json.verification_url,
+			verificationUrlComplete: result.json.verification_url_complete,
+			expiresIn: Number(result.json.expires_in || 0),
+			interval: Number(result.json.interval || 5),
+		} as DeviceAuthorizationResponse;
+	});
+
+const exchangeDeviceCode = async ({
+	clientId,
+	deviceCode,
+}: {
+	clientId: string;
+	deviceCode: string;
+}) =>
+	requestUrl({
+		url: GOOGLE_TOKEN_ENDPOINT,
+		method: "POST",
+		contentType: "application/x-www-form-urlencoded",
+		body: new URLSearchParams({
+				client_id: clientId,
+			device_code: deviceCode,
+			grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+		}).toString(),
+		throw: false,
+	});
+
+export const pollDeviceAuthorization = async ({
+	clientId,
+	deviceCode,
+	interval,
+	expiresIn,
+	isCancelled,
+}: {
+	clientId: string;
+	deviceCode: string;
+	interval: number;
+	expiresIn: number;
+	isCancelled?: () => boolean;
+}) => {
+	const startedAt = Date.now();
+	let pollIntervalMs = interval * 1000;
+
+	while (Date.now() - startedAt < expiresIn * 1000) {
+		if (isCancelled?.()) {
+			throw new DeviceAuthorizationPollingError(
+				"unknown",
+				"Device authorization canceled by user."
+			);
+		}
+
+		const result = await exchangeDeviceCode({ clientId, deviceCode });
+		if (result.status < 400) {
+			return {
+				accessToken: result.json.access_token,
+				refreshToken: result.json.refresh_token,
+				expiresIn: Number(result.json.expires_in || 0),
+				tokenType: result.json.token_type,
+				scope: result.json.scope,
+			} as OAuthTokens;
+		}
+
+		const code =
+			typeof result.json?.error === "string"
+				? (result.json.error as DeviceAuthorizationError)
+				: "unknown";
+
+		if (code === "authorization_pending") {
+			await sleep(pollIntervalMs);
+			continue;
+		}
+
+		if (code === "slow_down") {
+			pollIntervalMs += 5000;
+			await sleep(pollIntervalMs);
+			continue;
+		}
+
+		if (code === "access_denied") {
+			throw new DeviceAuthorizationPollingError(
+				"access_denied",
+				"Google sign-in was denied by the user."
+			);
+		}
+
+		if (code === "expired_token") {
+			throw new DeviceAuthorizationPollingError(
+				"expired_token",
+				"Device authorization session expired."
+			);
+		}
+
+		throw new DeviceAuthorizationPollingError(
+			"unknown",
+			result.text || "Device authorization failed."
+		);
 	}
 
-	if (trimmed.includes("://") || trimmed.includes("?")) {
-		const url = new URL(trimmed);
-		return Object.fromEntries(url.searchParams.entries());
-	}
-
-	return { code: trimmed };
+	throw new DeviceAuthorizationPollingError(
+		"expired_token",
+		"Device authorization timed out."
+	);
 };
