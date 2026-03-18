@@ -1,5 +1,7 @@
 import esbuild from "esbuild";
+import fs from "fs/promises";
 import process from "process";
+import path from "path";
 import builtins from "builtin-modules";
 
 const banner = `/*
@@ -9,11 +11,29 @@ if you want to view the source, please visit the github repository of this plugi
 `;
 
 const prod = process.argv[2] === "production";
+const outDir = "google-drive-sync";
+
+const copyStaticPlugin = {
+	name: "copy-static-plugin-files",
+	setup(build) {
+		build.onEnd(async () => {
+			await fs.mkdir(outDir, { recursive: true });
+			await Promise.all([
+				fs.copyFile(
+					"manifest.json",
+					path.join(outDir, "manifest.json")
+				),
+				fs.copyFile("styles.css", path.join(outDir, "styles.css")),
+			]);
+		});
+	},
+};
 
 const context = await esbuild.context({
 	banner: {
 		js: banner,
 	},
+	plugins: [copyStaticPlugin],
 	entryPoints: ["main.ts"],
 	bundle: true,
 	external: [
@@ -37,7 +57,7 @@ const context = await esbuild.context({
 	logLevel: "info",
 	sourcemap: prod ? false : "inline",
 	treeShaking: true,
-	outfile: "main.js",
+	outfile: path.join(outDir, "main.js"),
 	minify: prod,
 });
 

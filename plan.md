@@ -1,0 +1,160 @@
+# OAuth Refactor Plan (No Implementation)
+
+## Goal
+Replace the current hosted-token flow (https://ogd.richardxiong.com) with a first-party Google OAuth flow in the plugin, using browser-based sign-in that works on both Windows and Android.
+
+## Current State Summary
+- Hosted auth dependency is currently used for token exchange and connectivity checks.
+- Existing plugin settings store only a refresh token and expect the user to paste it manually.
+- Key touchpoints:
+  - `helpers/ky.ts`: refresh token -> access token via hosted endpoint.
+  - `helpers/drive.ts`: internet check via hosted ping endpoint.
+  - `main.ts`: settings UI links users to hosted website and asks for pasted refresh token.
+  - `README.md`: setup depends on hosted sign-in page.
+
+## Target Architecture
+Implement OAuth 2.0 Authorization Code + PKCE directly in-plugin, without any custom backend.
+
+### Core OAuth Flow
+1. User clicks `Connect Google Account` in plugin settings.
+2. Plugin generates and stores temporary PKCE state:
+   - `code_verifier`
+   - `code_challenge` (S256)
+   - `state`
+   - `issuedAt`
+3. Plugin opens browser to Google authorization URL.
+4. User signs in and consents.
+5. Browser redirects back to Obsidian using plugin callback route.
+6. Plugin validates `state`, exchanges `code` directly with Google token endpoint.
+7. Plugin stores tokens and enables sync.
+
+## Cross-Platform Callback Strategy (Windows + Android)
+Use an Obsidian protocol callback as primary strategy.
+
+### Primary
+- Register plugin callback handler using Obsidian protocol support.
+- Use a redirect URI compatible with both desktop and mobile Obsidian deep links.
+- Browser returns auth code directly into plugin handler.
+
+### Fallback
+- If protocol callback is unavailable on a platform/version, provide a manual one-time paste flow:
+  - Browser lands on Google redirect page with auth code.
+  - User pastes code into plugin dialog.
+  - Plugin continues token exchange.
+
+### Decision Gate
+Before coding, verify exact Obsidian protocol handler API behavior and callback URL format on:
+- Windows desktop Obsidian
+- Android Obsidian app
+
+If callback format differs by platform, normalize in one parser utility.
+
+## Planned Code Changes
+
+### 1. Token Model and Settings
+Update settings model to support OAuth lifecycle:
+- Add fields:
+  - `refreshToken`
+  - `accessToken`
+  - `accessTokenExpiresAt`
+  - `oauthPending` (state + verifier + timestamp)
+  - Optional: `connectedAccountEmail` (if fetched)
+- Add migration logic for existing settings shape.
+
+### 2. New OAuth Helper Module
+Create `helpers/oauth.ts` with:
+- PKCE utilities (verifier/challenge/state generation).
+- Authorization URL builder.
+- Callback parser + state validator.
+- Code exchange (`authorization_code`) against Google token endpoint.
+- Refresh flow (`refresh_token`) against Google token endpoint.
+
+### 3. Replace Hosted Exchange in HTTP Layer
+Refactor `helpers/ky.ts`:
+- Remove hosted endpoint call.
+- Refresh access token directly against Google OAuth endpoint.
+- Keep automatic refresh in request hooks.
+- Improve error handling for:
+  - revoked consent
+  - expired/invalid refresh token
+  - missing refresh token
+
+### 4. Replace Hosted Connectivity Check
+Refactor `helpers/drive.ts`:
+- Remove hosted ping URL.
+- Replace with a neutral connectivity strategy:
+  - either lightweight Google endpoint check
+  - or optimistic request strategy with explicit network error handling
+
+### 5. Settings UI and UX Refactor
+Refactor settings section in `main.ts`:
+- Remove `Get refresh token` external website link.
+- Remove manual refresh-token-first onboarding.
+- Add buttons/actions:
+  - `Connect Google Account`
+  - `Reconnect`
+  - `Disconnect`
+- Add status text:
+  - connected/disconnected
+  - token validity state
+- Add callback completion notices and actionable errors.
+
+### 6. Startup and Sync Guards
+Adjust plugin startup behavior:
+- If no valid token state, do not start pull/push automatically.
+- Prompt user to connect account.
+- Preserve existing sync state machine when connected.
+
+### 7. Documentation and Metadata
+Update docs and public metadata:
+- `README.md` setup instructions for in-plugin OAuth.
+- Remove statements that mention hosted token conversion/ping dependency.
+- Review `manifest.json` and wording to ensure auth path is accurately described.
+
+## Security and Privacy Requirements
+- No client secret embedded in plugin.
+- PKCE required for authorization code flow.
+- Strict state validation to prevent CSRF.
+- Clear pending OAuth state after success/failure/timeout.
+- Avoid logging tokens or auth codes.
+- Store only minimum token state needed for operation.
+
+## Backward Compatibility and Migration
+- Existing users with valid saved refresh token continue to work.
+- On first token refresh failure due to revocation, require reconnect instead of silent failure.
+- Do not remove legacy fields until migration confirms success.
+
+## Testing Plan
+
+### Functional
+- Fresh install auth flow on Windows.
+- Fresh install auth flow on Android.
+- Reconnect flow after disconnect.
+- Token refresh after expiry.
+- Startup behavior when offline.
+
+### Failure Cases
+- User cancels consent.
+- State mismatch.
+- Callback not received.
+- Invalid/revoked refresh token.
+- Network timeout during exchange/refresh.
+
+### Regression
+- Pull, push, and reset still work post-auth change.
+- Existing vault operations tracking unaffected.
+
+## Rollout Steps
+1. Implement callback plumbing and OAuth helper first.
+2. Swap token refresh path.
+3. Replace settings UI and onboarding.
+4. Remove hosted dependencies and docs references.
+5. Run cross-platform manual QA matrix.
+6. Ship with clear release notes about new sign-in flow.
+
+## Acceptance Criteria
+- No runtime dependency on https://ogd.richardxiong.com for auth or connectivity.
+- User can connect account entirely in-plugin using browser OAuth on Windows and Android.
+- Access token refresh works without manual copy/paste after initial consent.
+- Auth errors are user-actionable and do not corrupt sync state.
+- README setup steps reflect only the new OAuth flow.
