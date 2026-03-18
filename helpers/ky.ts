@@ -2,18 +2,20 @@ import ky, { Hooks } from "ky";
 import ObsidianGoogleDrive from "main";
 import { Notice } from "obsidian";
 import { checkConnection } from "./drive";
+import { refreshWithGoogle } from "./oauth";
 
 const getHooks = (t: ObsidianGoogleDrive): Hooks => ({
 	beforeRequest: [
 		async (request) => {
+			if (
+				!t.accessToken.token ||
+				t.accessToken.expiresAt - Date.now() < 60000
+			) {
+				await refreshAccessToken(t);
+			}
+
 			if (t.accessToken.token) {
-				if (t.accessToken.expiresAt - Date.now() < 60000) {
-					await refreshAccessToken(t);
-				}
-				request.headers.set(
-					"Authorization",
-					`Bearer ${t.accessToken.token}`
-				);
+				request.headers.set("Authorization", `Bearer ${t.accessToken.token}`);
 			}
 			return request;
 		},
@@ -38,33 +40,55 @@ export const getDriveKy = (t: ObsidianGoogleDrive) => {
 };
 
 export const refreshAccessToken = async (t: ObsidianGoogleDrive) => {
+	if (!t.settings.oauthClientId) {
+		new Notice(
+			"Google OAuth client ID is not configured. Set it in plugin settings before syncing.",
+			0
+		);
+		return;
+	}
+
+	if (!t.settings.refreshToken) {
+		new Notice(
+			"No Google refresh token found. Reconnect your Google account in plugin settings.",
+			0
+		);
+		return;
+	}
+
 	try {
-		const { expires_in, access_token } = await ky
-			.post("https://ogd.richardxiong.com/api/access", {
-				json: { refresh_token: t.settings.refreshToken },
-			})
-			.json<any>();
+		const tokens = await refreshWithGoogle({
+			clientId: t.settings.oauthClientId,
+			refreshToken: t.settings.refreshToken,
+		});
 
 		t.accessToken = {
-			token: access_token,
-			expiresAt: Date.now() + expires_in * 1000,
+			token: tokens.accessToken,
+			expiresAt: Date.now() + tokens.expiresIn * 1000,
 		};
+
+		t.settings.accessToken = t.accessToken.token;
+		t.settings.accessTokenExpiresAt = t.accessToken.expiresAt;
+		await t.saveSettings();
 		return t.accessToken;
 	} catch (e: any) {
 		if (!(await checkConnection())) {
 			return new Notice(
-				"Something is wrong with your internet connection, so we could not fetch a new access token! Once you're back online, please restart Obsidian.",
+				"Something is wrong with your internet connection, so we could not fetch a new access token. Once you're back online, try syncing again.",
 				0
 			);
 		}
+
 		t.settings.refreshToken = "";
+		t.settings.accessToken = "";
+		t.settings.accessTokenExpiresAt = 0;
 		t.accessToken = {
 			token: "",
 			expiresAt: 0,
 		};
 
 		new Notice(
-			"Something is wrong with your refresh token, please restart Obsidian and then reset it.",
+			"Google OAuth refresh failed. Reconnect your Google account in plugin settings.",
 			0
 		);
 		await t.saveSettings();

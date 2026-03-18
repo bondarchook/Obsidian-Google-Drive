@@ -5,8 +5,8 @@ This is an unofficial sync plugin for Obsidian, specifically for Google Drive.
 ## Disclaimer
 
 -   This is **not** the [official sync service](https://obsidian.md/sync) provided by Obsidian
--   This plugin communicates with external servers, namely the Google Drive API and [https://ogd.richardxiong.com](https://ogd.richardxiong.com)
-    -   The details of this communication are explained at the bottom of the notes section
+-   This plugin communicates with external servers, namely Google OAuth and the Google Drive API
+    -   OAuth is handled directly in-plugin (no hosted token-conversion service)
 
 ## Caution
 
@@ -51,18 +51,18 @@ This is an unofficial sync plugin for Obsidian, specifically for Google Drive.
 -   Do **NOT** change the Obsidian configuration folder
     -   If you really want to, make a new vault, change the folder, enable the plugin, and copy your files over (you can move the contents of .obsidian to the new folder through file explorer)
 -   This only accesses the Google Drive API to sync files and does not access or store any data outside of the user's device
--   This only accesses [https://ogd.richardxiong.com](https://ogd.richardxiong.com) to convert refresh tokens into access tokens (while hiding the client secret) and to check internet connectivity with a simple ping request
+-   This only accesses Google OAuth and Google Drive APIs required for authentication and sync
 
 ## Setup
 
-Note: Instructions are also on this plugin's homepage with images at [https://ogd.richardxiong.com](https://ogd.richardxiong.com)
-
-1. Visit this plugin's homepage at [https://ogd.richardxiong.com](https://ogd.richardxiong.com)
-2. Click `Sign In` at the top right and log in with your Google account
-3. Copy the refresh token that appears after logging in
-4. Enable the Google Drive Sync plugin in Obsidian
-5. Paste the refresh token into the plugin settings in Obsidian
+1. Enable the Google Drive Sync plugin in Obsidian
+2. Open plugin settings
+3. Enter your Google OAuth client ID
+4. Click `Connect Google Account`
+5. Complete consent in your browser and return to Obsidian
 6. Reload the Obsidian app
+
+If Obsidian does not return automatically after browser consent (for example on some Android setups), paste the full callback URL in the plugin setting `Manual callback URL or code` and click `Complete OAuth`.
 
 ## Use
 
@@ -91,4 +91,4 @@ Note: Instructions are also on this plugin's homepage with images at [https://og
     -   Instead, make a new vault, sync it, and transfer your files over
     -   We will not add any implementation to automate this process because it inherently messes with other synced devices
 
-Privacy Policy: [https://ogd.richardxiong.com/privacy](https://ogd.richardxiong.com/privacy)
+Privacy Policy: See Google OAuth and Google Drive platform policies for account consent and API usage.

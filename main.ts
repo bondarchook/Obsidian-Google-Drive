@@ -1,5 +1,11 @@
 import { checkConnection, getDriveClient } from "helpers/drive";
 import { refreshAccessToken } from "helpers/ky";
+import {
+	buildAuthorizationUrl,
+	createOAuthPending,
+	exchangeAuthorizationCode,
+	parseOAuthCallbackInput,
+} from "helpers/oauth";
 import { pull } from "helpers/pull";
 import { push } from "helpers/push";
 import { reset } from "helpers/reset";
@@ -16,6 +22,13 @@ import {
 } from "obsidian";
 
 interface PluginSettings {
+	oauthClientId: string;
+	oauthRedirectUri: string;
+	accessToken: string;
+	accessTokenExpiresAt: number;
+	oauthState: string;
+	oauthCodeVerifier: string;
+	oauthStartedAt: number;
 	refreshToken: string;
 	operations: Record<string, "create" | "delete" | "modify">;
 	driveIdToPath: Record<string, string>;
@@ -24,6 +37,13 @@ interface PluginSettings {
 }
 
 const DEFAULT_SETTINGS: PluginSettings = {
+	oauthClientId: "",
+	oauthRedirectUri: "obsidian://google-drive-sync-oauth",
+	accessToken: "",
+	accessTokenExpiresAt: 0,
+	oauthState: "",
+	oauthCodeVerifier: "",
+	oauthStartedAt: 0,
 	refreshToken: "",
 	operations: {},
 	driveIdToPath: {},
@@ -40,17 +60,31 @@ export default class ObsidianGoogleDrive extends Plugin {
 	drive = getDriveClient(this);
 	ribbonIcon: HTMLElement;
 	syncing: boolean;
+	private static readonly OAUTH_ACTION = "google-drive-sync-oauth";
 
 	async onload() {
 		const { vault } = this.app;
 
 		await this.loadSettings();
+		this.registerObsidianProtocolHandler(
+			ObsidianGoogleDrive.OAUTH_ACTION,
+			(params) => {
+				void this.completeOAuth(params);
+			}
+		);
 
 		this.addSettingTab(new SettingsTab(this.app, this));
 
+		if (this.settings.accessToken && this.settings.accessTokenExpiresAt > Date.now()) {
+			this.accessToken = {
+				token: this.settings.accessToken,
+				expiresAt: this.settings.accessTokenExpiresAt,
+			};
+		}
+
 		if (!this.settings.refreshToken) {
 			new Notice(
-				"Please add your refresh token to Google Drive Sync through our website or our readme/this plugin's settings. If you haven't already, PLEASE read through this plugin's readme or website CAREFULLY for instructions on how to use this plugin. If you don't know what you're doing, your data could get DELETED.",
+				"Google Drive Sync is not connected yet. Open plugin settings and complete Google OAuth setup.",
 				0
 			);
 			return;
@@ -141,6 +175,13 @@ export default class ObsidianGoogleDrive extends Plugin {
 			DEFAULT_SETTINGS,
 			await this.loadData()
 		);
+
+		if (
+			this.settings.oauthState &&
+			Date.now() - this.settings.oauthStartedAt > 10 * 60 * 1000
+		) {
+			this.clearOAuthPending();
+		}
 	}
 
 	saveSettings() {
@@ -148,6 +189,169 @@ export default class ObsidianGoogleDrive extends Plugin {
 	}
 
 	debouncedSaveSettings = debounce(this.saveSettings.bind(this), 500, true);
+
+	private clearOAuthPending() {
+		this.settings.oauthState = "";
+		this.settings.oauthCodeVerifier = "";
+		this.settings.oauthStartedAt = 0;
+	}
+
+	private getOAuthPending() {
+		if (!this.settings.oauthState || !this.settings.oauthCodeVerifier) {
+			return;
+		}
+
+		return {
+			state: this.settings.oauthState,
+			codeVerifier: this.settings.oauthCodeVerifier,
+			issuedAt: this.settings.oauthStartedAt,
+		};
+	}
+
+	private isVaultReadyForInitialSync() {
+		if (this.settings.changesToken) {
+			return true;
+		}
+
+		const hasLocalFiles =
+			this.app.vault
+				.getAllLoadedFiles()
+				.filter(({ path }) => path !== "/").length > 0;
+
+		if (hasLocalFiles) {
+			new Notice(
+				"Your current vault is not empty. Clear the vault before first-time Google Drive onboarding, or reconnect from an already-synced vault.",
+				0
+			);
+			return false;
+		}
+
+		return true;
+	}
+
+	async startOAuthFlow() {
+		if (!this.settings.oauthClientId.trim()) {
+			new Notice("Set a Google OAuth client ID in plugin settings first.", 0);
+			return;
+		}
+
+		if (!this.isVaultReadyForInitialSync()) {
+			return;
+		}
+
+		const pending = await createOAuthPending();
+		this.settings.oauthState = pending.state;
+		this.settings.oauthCodeVerifier = pending.codeVerifier;
+		this.settings.oauthStartedAt = pending.issuedAt;
+		await this.saveSettings();
+
+		const url = await buildAuthorizationUrl({
+			clientId: this.settings.oauthClientId.trim(),
+			redirectUri: this.settings.oauthRedirectUri.trim(),
+			pending,
+		});
+
+		window.open(url, "_blank", "noopener");
+		new Notice(
+			"Browser opened for Google sign-in. If Obsidian does not return automatically, paste the full callback URL in plugin settings.",
+			0
+		);
+	}
+
+	async completeOAuthFromInput(input: string) {
+		const params = parseOAuthCallbackInput(input);
+		await this.completeOAuth(params);
+	}
+
+	async completeOAuth(params: Record<string, string | "true">) {
+		if (typeof params.error === "string") {
+			new Notice(`Google OAuth error: ${params.error}`, 0);
+			this.clearOAuthPending();
+			await this.saveSettings();
+			return;
+		}
+
+		const code = typeof params.code === "string" ? params.code : "";
+		if (!code) {
+			new Notice("Missing OAuth code in callback.", 0);
+			return;
+		}
+
+		const pending = this.getOAuthPending();
+		if (!pending) {
+			new Notice(
+				"OAuth session was not found. Start 'Connect Google Account' again.",
+				0
+			);
+			return;
+		}
+
+		const incomingState =
+			typeof params.state === "string" ? params.state : "";
+		if (incomingState && incomingState !== pending.state) {
+			new Notice("OAuth state mismatch. Please retry sign-in.", 0);
+			this.clearOAuthPending();
+			await this.saveSettings();
+			return;
+		}
+
+		try {
+			const tokens = await exchangeAuthorizationCode({
+				clientId: this.settings.oauthClientId.trim(),
+				redirectUri: this.settings.oauthRedirectUri.trim(),
+				code,
+				codeVerifier: pending.codeVerifier,
+			});
+
+			if (!tokens.refreshToken && !this.settings.refreshToken) {
+				new Notice(
+					"OAuth succeeded but no refresh token was returned. Revoke app access in your Google account and try connecting again.",
+					0
+				);
+				return;
+			}
+
+			this.settings.refreshToken = tokens.refreshToken || this.settings.refreshToken;
+			this.settings.accessToken = tokens.accessToken;
+			this.settings.accessTokenExpiresAt =
+				Date.now() + tokens.expiresIn * 1000;
+			this.accessToken = {
+				token: this.settings.accessToken,
+				expiresAt: this.settings.accessTokenExpiresAt,
+			};
+
+			if (!this.settings.changesToken) {
+				const changesToken = await this.drive.getChangesStartToken();
+				if (!changesToken) {
+					new Notice("Connected, but failed to fetch Drive changes token.", 0);
+					return;
+				}
+				this.settings.changesToken = changesToken;
+			}
+
+			this.clearOAuthPending();
+			await this.saveSettings();
+			new Notice(
+				"Google account connected. Reload Obsidian to activate full sync events and ribbon actions.",
+				0
+			);
+		} catch (error) {
+			new Notice("Google OAuth code exchange failed. Please try again.", 0);
+		}
+	}
+
+	async disconnectOAuth() {
+		this.clearOAuthPending();
+		this.settings.refreshToken = "";
+		this.settings.accessToken = "";
+		this.settings.accessTokenExpiresAt = 0;
+		this.accessToken = {
+			token: "",
+			expiresAt: 0,
+		};
+		await this.saveSettings();
+		new Notice("Google account disconnected from this plugin.");
+	}
 
 	handleCreate(file: TAbstractFile) {
 		if (this.settings.operations[file.path] === "delete") {
@@ -314,65 +518,82 @@ class SettingsTab extends PluginSettingTab {
 
 	display(): void {
 		const { containerEl } = this;
-		const { vault } = this.app;
 
 		containerEl.empty();
 
-		containerEl.createEl("a", {
-			href: "https://ogd.richardxiong.com",
-			text: "Get refresh token",
-		});
+		containerEl.createEl("h3", { text: "Google OAuth" });
 
 		new Setting(containerEl)
-			.setName("Refresh token")
+			.setName("OAuth client ID")
 			.setDesc(
-				"A refresh token is required to access your Google Drive for syncing. We suggest cloning your Google Drive vault to the current vault BEFORE syncing."
+				"Google OAuth client ID for this plugin. Use an app/client configured for Obsidian protocol redirects."
 			)
 			.addText((text) => {
-				const cancel = () => {
-					this.plugin.settings.refreshToken = "";
-					text.setValue("");
-					return this.plugin.saveSettings();
-				};
-
-				text.setPlaceholder("Enter your refresh token")
-					.setValue(this.plugin.settings.refreshToken)
-					.onChange(async (value) => {
-						this.plugin.settings.refreshToken = value;
-						if (!value) {
-							return this.plugin.debouncedSaveSettings();
-						}
-						if (!(await refreshAccessToken(this.plugin))) {
-							text.setValue("");
-							return;
-						}
-						if (
-							vault
-								.getAllLoadedFiles()
-								.filter(({ path }) => path !== "/").length > 0
-						) {
-							new Notice(
-								"Your current vault is not empty! If you want our plugin to handle the initial sync, you have to clear out the current vault. Check the readme or website for more details.",
-								0
-							);
-							return cancel();
-						}
-
-						const changesToken =
-							await this.plugin.drive.getChangesStartToken();
-						if (!changesToken) {
-							return new Notice(
-								"An error occurred fetching Google Drive changes token."
-							);
-						}
-						this.plugin.settings.changesToken = changesToken;
-
-						await this.plugin.saveSettings();
-						new Notice(
-							"Refresh token saved! Reload Obsidian to activate sync.",
-							0
-						);
+				text
+					.setPlaceholder("Enter Google OAuth client ID")
+					.setValue(this.plugin.settings.oauthClientId)
+					.onChange((value) => {
+						this.plugin.settings.oauthClientId = value.trim();
+						this.plugin.debouncedSaveSettings();
 					});
 			});
+
+		new Setting(containerEl)
+			.setName("Redirect URI")
+			.setDesc(
+				"Obsidian callback URI. Keep default unless you have a custom protocol setup."
+			)
+			.addText((text) => {
+				text
+					.setPlaceholder("obsidian://google-drive-sync-oauth")
+					.setValue(this.plugin.settings.oauthRedirectUri)
+					.onChange((value) => {
+						this.plugin.settings.oauthRedirectUri = value.trim();
+						this.plugin.debouncedSaveSettings();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName("Account")
+			.setDesc(
+				this.plugin.settings.refreshToken
+					? "Connected"
+					: "Not connected"
+			)
+			.addButton((button) =>
+				button.setButtonText("Connect Google Account").onClick(async () => {
+					await this.plugin.startOAuthFlow();
+				})
+			)
+			.addButton((button) =>
+				button.setButtonText("Disconnect").onClick(async () => {
+					await this.plugin.disconnectOAuth();
+					this.display();
+				})
+			);
+
+		let callbackInput = "";
+		new Setting(containerEl)
+			.setName("Manual callback URL or code")
+			.setDesc(
+				"Fallback for Android/desktop if callback does not auto-return to Obsidian. Paste the full callback URL or just the code."
+			)
+			.addText((text) => {
+				text
+					.setPlaceholder("obsidian://google-drive-sync-oauth?code=...")
+					.onChange((value) => {
+						callbackInput = value;
+					});
+			})
+			.addButton((button) =>
+				button.setButtonText("Complete OAuth").onClick(async () => {
+					await this.plugin.completeOAuthFromInput(callbackInput);
+					this.display();
+				})
+			);
+
+		containerEl.createEl("p", {
+			text: "After connecting, reload Obsidian if sync ribbon/actions are not visible yet.",
+		});
 	}
 }

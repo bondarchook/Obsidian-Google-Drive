@@ -528,7 +528,7 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 
 export const checkConnection = async () => {
 	try {
-		const result = await ky.get("https://ogd.richardxiong.com/api/ping");
+		const result = await ky.get("https://www.googleapis.com/generate_204");
 		return result.ok;
 	} catch {
 		return false;
