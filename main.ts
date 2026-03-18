@@ -22,6 +22,7 @@ import {
 
 interface PluginSettings {
 	oauthClientId: string;
+	authDebugLogging: boolean;
 	accessToken: string;
 	accessTokenExpiresAt: number;
 	refreshToken: string;
@@ -33,6 +34,7 @@ interface PluginSettings {
 
 const DEFAULT_SETTINGS: PluginSettings = {
 	oauthClientId: "",
+	authDebugLogging: false,
 	accessToken: "",
 	accessTokenExpiresAt: 0,
 	refreshToken: "",
@@ -173,6 +175,16 @@ export default class ObsidianGoogleDrive extends Plugin {
 
 	debouncedSaveSettings = debounce(this.saveSettings.bind(this), 500, true);
 
+	private authDebug(message: string, metadata?: Record<string, unknown>) {
+		if (!this.settings.authDebugLogging) return;
+		const prefix = "[OGD Auth Debug]";
+		if (metadata) {
+			console.info(prefix, message, metadata);
+			return;
+		}
+		console.info(prefix, message);
+	}
+
 	private isVaultReadyForInitialSync() {
 		if (this.settings.changesToken) {
 			return true;
@@ -217,12 +229,15 @@ export default class ObsidianGoogleDrive extends Plugin {
 	}
 
 	async startOAuthFlow() {
+		this.authDebug("Starting device authorization flow.");
 		if (!this.settings.oauthClientId.trim()) {
+			this.authDebug("Missing OAuth client ID in settings.");
 			new Notice("Set a Google OAuth client ID in plugin settings first.", 0);
 			return;
 		}
 
 		if (!this.isVaultReadyForInitialSync()) {
+			this.authDebug("Vault readiness check failed for initial sync.");
 			return;
 		}
 
@@ -233,6 +248,14 @@ export default class ObsidianGoogleDrive extends Plugin {
 		try {
 			const deviceAuth = await startDeviceAuthorization({
 				clientId: this.settings.oauthClientId.trim(),
+			});
+			this.authDebug("Received device authorization response.", {
+				expiresIn: deviceAuth.expiresIn,
+				interval: deviceAuth.interval,
+				hasVerificationUrlComplete: Boolean(
+					deviceAuth.verificationUrlComplete
+				),
+				verificationUrl: deviceAuth.verificationUrl,
 			});
 			this.deviceAuthUserCode = deviceAuth.userCode;
 			this.deviceAuthVerificationUrl =
@@ -252,9 +275,17 @@ export default class ObsidianGoogleDrive extends Plugin {
 				interval: deviceAuth.interval,
 				expiresIn: deviceAuth.expiresIn,
 				isCancelled: () => this.cancelDeviceAuthPolling,
+				onStatus: (message) => this.authDebug(message),
+			});
+			this.authDebug("Token polling returned success.", {
+				hasRefreshToken: Boolean(tokens.refreshToken),
+				expiresIn: tokens.expiresIn,
+				tokenType: tokens.tokenType,
+				scope: tokens.scope || "",
 			});
 
 			if (!tokens.refreshToken && !this.settings.refreshToken) {
+				this.authDebug("No refresh token returned and none exists in settings.");
 				new Notice(
 					"Google sign-in succeeded but no refresh token was returned. Revoke app access in Google and try connecting again.",
 					0
@@ -264,24 +295,36 @@ export default class ObsidianGoogleDrive extends Plugin {
 			}
 
 			this.applyOAuthTokens(tokens);
+			this.authDebug("Applied OAuth tokens to plugin settings/runtime.", {
+				hasRefreshToken: Boolean(this.settings.refreshToken),
+				accessTokenExpiresAt: this.settings.accessTokenExpiresAt,
+			});
 
 			if (!this.settings.changesToken) {
+				this.authDebug("No changes token found. Fetching start token.");
 				const changesToken = await this.drive.getChangesStartToken();
 				if (!changesToken) {
+					this.authDebug("Failed to fetch Drive changes start token.");
 					new Notice("Connected, but failed to fetch Drive changes token.", 0);
 					this.deviceAuthStatus = "Connected, but changes token fetch failed.";
 					return;
 				}
 				this.settings.changesToken = changesToken;
+				this.authDebug("Stored Drive changes token after connect.");
 			}
 
 			this.deviceAuthStatus = "Connected";
 			await this.saveSettings();
+			this.authDebug("OAuth connect flow finished successfully.");
 			new Notice(
 				"Google account connected. Reload Obsidian to activate full sync events and ribbon actions.",
 				0
 			);
 		} catch (error) {
+			this.authDebug("OAuth connect flow threw an error.", {
+				errorType: error instanceof Error ? error.name : typeof error,
+				message: error instanceof Error ? error.message : String(error),
+			});
 			if (
 				error instanceof DeviceAuthorizationPollingError &&
 				error.code === "access_denied"
@@ -302,20 +345,28 @@ export default class ObsidianGoogleDrive extends Plugin {
 				new Notice("Google sign-in canceled.");
 			} else {
 				this.deviceAuthStatus = "Sign-in failed.";
-				new Notice("Google device authorization failed. Please try again.", 0);
+				const suffix =
+					error instanceof Error ? ` (${error.message})` : "";
+				new Notice(
+					`Google device authorization failed. Please try again.${suffix}`,
+					0
+				);
 			}
 		} finally {
+			this.authDebug("Clearing runtime state for device auth flow.");
 			this.clearDeviceAuthRuntimeState();
 		}
 	}
 
 	cancelOAuthFlow() {
 		if (!this.deviceAuthInProgress) return;
+		this.authDebug("Cancel requested by user.");
 		this.cancelDeviceAuthPolling = true;
 		this.deviceAuthStatus = "Canceling sign-in...";
 	}
 
 	async disconnectOAuth() {
+		this.authDebug("Disconnecting OAuth credentials.");
 		this.cancelDeviceAuthPolling = true;
 		this.clearDeviceAuthRuntimeState();
 		this.settings.refreshToken = "";
@@ -511,6 +562,25 @@ class SettingsTab extends PluginSettingTab {
 					.onChange((value) => {
 						this.plugin.settings.oauthClientId = value.trim();
 						this.plugin.debouncedSaveSettings();
+					});
+			});
+
+		new Setting(containerEl)
+			.setName("Debug auth logging")
+			.setDesc(
+				"Logs detailed authentication lifecycle messages to the developer console for troubleshooting."
+			)
+			.addToggle((toggle) => {
+				toggle
+					.setValue(this.plugin.settings.authDebugLogging)
+					.onChange(async (value) => {
+						this.plugin.settings.authDebugLogging = value;
+						await this.plugin.saveSettings();
+						new Notice(
+							value
+								? "Auth debug logging enabled. Open developer console to view logs."
+								: "Auth debug logging disabled."
+						);
 					});
 			});
 

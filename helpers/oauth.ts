@@ -136,18 +136,22 @@ export const pollDeviceAuthorization = async ({
 	interval,
 	expiresIn,
 	isCancelled,
+	onStatus,
 }: {
 	clientId: string;
 	deviceCode: string;
 	interval: number;
 	expiresIn: number;
 	isCancelled?: () => boolean;
+	onStatus?: (message: string) => void;
 }) => {
 	const startedAt = Date.now();
 	let pollIntervalMs = interval * 1000;
+	onStatus?.("Polling for Google device authorization...");
 
 	while (Date.now() - startedAt < expiresIn * 1000) {
 		if (isCancelled?.()) {
+			onStatus?.("Polling canceled by user.");
 			throw new DeviceAuthorizationPollingError(
 				"unknown",
 				"Device authorization canceled by user."
@@ -156,6 +160,7 @@ export const pollDeviceAuthorization = async ({
 
 		const result = await exchangeDeviceCode({ clientId, deviceCode });
 		if (result.status < 400) {
+			onStatus?.("Device authorization approved. Received tokens.");
 			return {
 				accessToken: result.json.access_token,
 				refreshToken: result.json.refresh_token,
@@ -171,17 +176,22 @@ export const pollDeviceAuthorization = async ({
 				: "unknown";
 
 		if (code === "authorization_pending") {
+			onStatus?.(`Authorization pending. Waiting ${pollIntervalMs / 1000}s...`);
 			await sleep(pollIntervalMs);
 			continue;
 		}
 
 		if (code === "slow_down") {
 			pollIntervalMs += 5000;
+			onStatus?.(
+				`Received slow_down. New polling interval: ${pollIntervalMs / 1000}s.`
+			);
 			await sleep(pollIntervalMs);
 			continue;
 		}
 
 		if (code === "access_denied") {
+			onStatus?.("Access denied by user during device authorization.");
 			throw new DeviceAuthorizationPollingError(
 				"access_denied",
 				"Google sign-in was denied by the user."
@@ -189,17 +199,26 @@ export const pollDeviceAuthorization = async ({
 		}
 
 		if (code === "expired_token") {
+			onStatus?.("Device code expired before approval.");
 			throw new DeviceAuthorizationPollingError(
 				"expired_token",
 				"Device authorization session expired."
 			);
 		}
 
+		const extra =
+			typeof result.json?.error_description === "string"
+				? ` ${result.json.error_description}`
+				: "";
+		onStatus?.(`Unexpected polling error (${code}).${extra}`);
+
 		throw new DeviceAuthorizationPollingError(
 			"unknown",
 			result.text || "Device authorization failed."
 		);
 	}
+
+	onStatus?.("Polling timed out before approval.");
 
 	throw new DeviceAuthorizationPollingError(
 		"expired_token",
