@@ -60,6 +60,7 @@ export const refreshAccessToken = async (t: ObsidianGoogleDrive) => {
 		const tokens = await refreshWithGoogle({
 			clientId: t.settings.oauthClientId,
 			refreshToken: t.settings.refreshToken,
+			clientSecret: t.settings.oauthClientSecret?.trim() || undefined,
 		});
 
 		t.accessToken = {

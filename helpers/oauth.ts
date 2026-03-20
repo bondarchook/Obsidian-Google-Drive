@@ -3,7 +3,7 @@ import { requestUrl } from "obsidian";
 const GOOGLE_DEVICE_ENDPOINT = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKEN_ENDPOINT = "https://oauth2.googleapis.com/token";
 
-export const OAUTH_SCOPE = "https://www.googleapis.com/auth/drive";
+export const OAUTH_SCOPE = "https://www.googleapis.com/auth/drive.file";
 
 export interface OAuthTokens {
 	accessToken: string;
@@ -68,12 +68,15 @@ const exchangeToken = async (
 export const refreshWithGoogle = async ({
 	clientId,
 	refreshToken,
+	clientSecret,
 }: {
 	clientId: string;
 	refreshToken: string;
+	clientSecret?: string;
 }) =>
 	exchangeToken({
 		client_id: clientId,
+		...(clientSecret ? { client_secret: clientSecret } : {}),
 		refresh_token: refreshToken,
 		grant_type: "refresh_token",
 	});
@@ -114,16 +117,19 @@ export const startDeviceAuthorization = async ({
 const exchangeDeviceCode = async ({
 	clientId,
 	deviceCode,
+	clientSecret,
 }: {
 	clientId: string;
 	deviceCode: string;
+	clientSecret?: string;
 }) =>
 	requestUrl({
 		url: GOOGLE_TOKEN_ENDPOINT,
 		method: "POST",
 		contentType: "application/x-www-form-urlencoded",
 		body: new URLSearchParams({
-				client_id: clientId,
+			client_id: clientId,
+			...(clientSecret ? { client_secret: clientSecret } : {}),
 			device_code: deviceCode,
 			grant_type: "urn:ietf:params:oauth:grant-type:device_code",
 		}).toString(),
@@ -133,6 +139,7 @@ const exchangeDeviceCode = async ({
 export const pollDeviceAuthorization = async ({
 	clientId,
 	deviceCode,
+	clientSecret,
 	interval,
 	expiresIn,
 	isCancelled,
@@ -140,6 +147,7 @@ export const pollDeviceAuthorization = async ({
 }: {
 	clientId: string;
 	deviceCode: string;
+	clientSecret?: string;
 	interval: number;
 	expiresIn: number;
 	isCancelled?: () => boolean;
@@ -158,7 +166,11 @@ export const pollDeviceAuthorization = async ({
 			);
 		}
 
-		const result = await exchangeDeviceCode({ clientId, deviceCode });
+		const result = await exchangeDeviceCode({
+			clientId,
+			deviceCode,
+			clientSecret,
+		});
 		if (result.status < 400) {
 			onStatus?.("Device authorization approved. Received tokens.");
 			return {

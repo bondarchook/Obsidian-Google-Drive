@@ -1,7 +1,7 @@
 import ky from "ky";
 import ObsidianGoogleDrive from "main";
 import { getDriveKy } from "./ky";
-import { TAbstractFile, TFolder } from "obsidian";
+import { requestUrl, TAbstractFile, TFolder } from "obsidian";
 
 export interface FileMetadata {
 	id: string;
@@ -527,9 +527,23 @@ export const getDriveClient = (t: ObsidianGoogleDrive) => {
 };
 
 export const checkConnection = async () => {
+	const probes = [
+		"https://www.googleapis.com/generate_204",
+		"https://www.gstatic.com/generate_204",
+	];
+
 	try {
-		const result = await ky.get("https://www.googleapis.com/generate_204");
-		return result.ok;
+		for (const url of probes) {
+			const result = await requestUrl({
+				url,
+				method: "GET",
+				throw: false,
+			});
+			if (result.status >= 200 && result.status < 400) {
+				return true;
+			}
+		}
+		return false;
 	} catch {
 		return false;
 	}
